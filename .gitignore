@@ -1,0 +1,38 @@
+# Python environments, caches, test output, and coverage
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# PyInstaller build output and generated specification files
+build/
+dist/
+*.spec
+
+# Locally downloaded media and app data
+downloads/
+
+# Local developer configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+version_info.txt
+
+# Editor, OS, and Codex workspace metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.agents/
+.codex/
