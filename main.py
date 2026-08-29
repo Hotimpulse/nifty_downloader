@@ -1,8 +1,10 @@
+import argparse
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -10,7 +12,13 @@ from tkinter import Tk, StringVar, IntVar, DoubleVar, END
 from tkinter import ttk, messagebox
 
 import yt_dlp
-from yt_dlp.utils import download_range_func
+
+try:
+    from build_metadata import BUILD_BRANCH, BUILD_COMMIT, BUILD_REMOTE
+except ImportError:
+    BUILD_BRANCH = "main"
+    BUILD_COMMIT = "unknown"
+    BUILD_REMOTE = ""
 
 
 if getattr(sys, "frozen", False):
@@ -29,7 +37,196 @@ DOWNLOAD_DIR = APP_ROOT / "downloads"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-SUPPORTED_PLATFORM_NAMES = "YouTube, Instagram, Facebook, and TikTok"
+SUPPORTED_PLATFORM_NAMES = "YouTube, X, Instagram, Facebook, and TikTok"
+UPDATE_LOG_NAME = "yt_downloader_update.log"
+
+
+def subprocess_window_options() -> dict:
+    """Prevent helper commands from flashing console windows on Windows."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def github_https_remote(remote: str) -> str:
+    """Convert a common GitHub SSH remote to a non-interactive HTTPS URL."""
+    remote = remote.strip()
+    match = re.fullmatch(r"git@github\.com:(.+?)(?:\.git)?", remote)
+    if match:
+        return f"https://github.com/{match.group(1)}.git"
+    match = re.fullmatch(r"ssh://git@github\.com/(.+?)(?:\.git)?", remote)
+    if match:
+        return f"https://github.com/{match.group(1)}.git"
+    return remote
+
+
+def git_output(source_root: Path, *args: str) -> str:
+    """Run a read-only git command and return stripped stdout."""
+    result = subprocess.run(
+        ["git", "-C", str(source_root), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=True,
+        **subprocess_window_options(),
+    )
+    return result.stdout.strip()
+
+
+def find_source_root() -> Path | None:
+    """Locate the checkout used to build or launch the app, when available."""
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        candidates = [executable_dir.parent, executable_dir]
+    else:
+        candidates = [Path(__file__).resolve().parent]
+
+    for candidate in candidates:
+        if (candidate / "pyproject.toml").is_file() and (
+            candidate / "build_app.py"
+        ).is_file():
+            return candidate
+    return None
+
+
+def remote_head_commit(remote: str, branch: str) -> str:
+    """Return the commit currently published for a remote branch."""
+    result = subprocess.run(
+        ["git", "ls-remote", github_https_remote(remote), f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=True,
+        **subprocess_window_options(),
+    )
+    line = result.stdout.strip().splitlines()
+    if not line:
+        raise RuntimeError(f"GitHub branch '{branch}' was not found.")
+    return line[0].split()[0]
+
+
+def current_update_identity() -> tuple[str, str, str]:
+    """Return the commit, remote, and branch represented by this app."""
+    source_root = find_source_root()
+    if not getattr(sys, "frozen", False) and source_root:
+        try:
+            return (
+                git_output(source_root, "rev-parse", "HEAD"),
+                git_output(source_root, "remote", "get-url", "origin"),
+                git_output(source_root, "branch", "--show-current") or "main",
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return BUILD_COMMIT, BUILD_REMOTE, BUILD_BRANCH
+
+
+def update_is_available(local_commit: str, remote_commit: str) -> bool:
+    """Treat any different published commit as a rebuild-worthy update."""
+    return bool(
+        local_commit
+        and remote_commit
+        and local_commit != "unknown"
+        and local_commit != remote_commit
+    )
+
+
+def run_update_worker(
+    remote: str,
+    branch: str,
+    target_executable: Path,
+) -> int:
+    """Clone, rebuild, replace, and relaunch the application."""
+    log_path = target_executable.parent / UPDATE_LOG_NAME
+    source_parent = Path(tempfile.mkdtemp(prefix="yt_downloader_update_source_"))
+    source_root = source_parent / "source"
+
+    try:
+        git = shutil.which("git")
+        uv = shutil.which("uv")
+        if not git or not uv:
+            missing = "Git" if not git else "uv"
+            raise RuntimeError(f"{missing} is required to rebuild the application.")
+
+        with log_path.open("w", encoding="utf-8") as log_file:
+            commands = [
+                [
+                    git,
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    branch,
+                    "--single-branch",
+                    github_https_remote(remote),
+                    str(source_root),
+                ],
+                [uv, "sync", "--locked", "--group", "dev"],
+                [uv, "run", "--locked", "--group", "dev", "python", "build_app.py"],
+            ]
+            for command in commands:
+                log_file.write(f"> {' '.join(command)}\n")
+                log_file.flush()
+                subprocess.run(
+                    command,
+                    cwd=source_root if source_root.is_dir() else source_parent,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=True,
+                    **subprocess_window_options(),
+                )
+
+        built_executable = source_root / "dist" / "yt_downloader.exe"
+        if not built_executable.is_file():
+            raise RuntimeError("The rebuilt executable was not produced.")
+
+        target_executable.parent.mkdir(parents=True, exist_ok=True)
+        last_error = None
+        for _attempt in range(20):
+            try:
+                shutil.copy2(built_executable, target_executable)
+                last_error = None
+                break
+            except PermissionError as error:
+                last_error = error
+                time.sleep(0.5)
+        if last_error:
+            raise last_error
+
+        subprocess.Popen([str(target_executable)], cwd=target_executable.parent)
+        return 0
+    except Exception as error:
+        try:
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"\nUPDATE FAILED: {error}\n")
+        except OSError:
+            pass
+        if target_executable.is_file():
+            subprocess.Popen(
+                [str(target_executable), "--update-error", str(log_path)],
+                cwd=target_executable.parent,
+            )
+        return 1
+
+
+def build_download_plan(
+    video_id: str | None,
+    audio_id: str | None,
+) -> tuple[str, str]:
+    """Return the exact yt-dlp format selector and requested download mode."""
+    if video_id and audio_id:
+        return f"{video_id}+{audio_id}", "video_audio"
+    if video_id:
+        return video_id, "video_only"
+    if audio_id:
+        return audio_id, "audio_only"
+    raise ValueError("A video or audio format must be selected.")
 
 
 def find_ffmpeg_location() -> str | None:
@@ -75,6 +272,8 @@ class VideoDownloaderGUI:
         self._progress_value = 0.0
         self._last_progress_update = 0.0
         self._is_checking_qualities = False
+        self._update_remote = ""
+        self._update_branch = "main"
 
         self.video_formats = []
         self.audio_formats = []
@@ -82,6 +281,8 @@ class VideoDownloaderGUI:
         self.audio_id_to_format = {}
 
         self._build_ui()
+        if sys.platform == "win32":
+            self._run_in_thread(self._check_for_update_worker)
 
     def _build_ui(self):
         frame = ttk.Frame(self.root, padding=12)
@@ -96,6 +297,11 @@ class VideoDownloaderGUI:
             text="Open Download Folder",
             command=self.open_download_folder,
         ).pack(side="right")
+        self.update_button = ttk.Button(
+            toolbar,
+            text="DOWNLOAD UPDATE & REBUILD",
+            command=self.download_update_and_rebuild,
+        )
 
         # Download progress (kept at the bottom of the window)
         progress_frame = ttk.Frame(frame)
@@ -124,7 +330,7 @@ class VideoDownloaderGUI:
         single_card = ttk.LabelFrame(frame, text="Single Video", padding=12)
         single_card.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(single_card, text="Video URL (YouTube, Instagram, Facebook, or TikTok):").grid(row=0, column=0, sticky="w")
+        ttk.Label(single_card, text="Video URL (YouTube, X, Instagram, Facebook, or TikTok):").grid(row=0, column=0, sticky="w")
         self.url_entry = ttk.Entry(single_card, textvariable=self.url_var, width=95)
         self.url_entry.grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 8))
         self.url_entry.bind("<Return>", self._check_url_from_entry)
@@ -166,6 +372,13 @@ class VideoDownloaderGUI:
         self.video_list.heading("label", text="Format")
         self.video_list.column("label", width=420)
         self.video_list.pack(fill="both", expand=True)
+        ttk.Button(
+            video_frame,
+            text="Deselect Video",
+            command=lambda: self.video_list.selection_remove(
+                *self.video_list.selection()
+            ),
+        ).pack(anchor="w", pady=(6, 0))
 
         audio_frame = ttk.LabelFrame(lists_frame, text="Audio Quality", padding=8)
         audio_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
@@ -173,6 +386,13 @@ class VideoDownloaderGUI:
         self.audio_list.heading("label", text="Format")
         self.audio_list.column("label", width=420)
         self.audio_list.pack(fill="both", expand=True)
+        ttk.Button(
+            audio_frame,
+            text="Deselect Audio",
+            command=lambda: self.audio_list.selection_remove(
+                *self.audio_list.selection()
+            ),
+        ).pack(anchor="w", pady=(6, 0))
 
         # Batch section
         batch_card = ttk.LabelFrame(frame, text="Batch Download (Channels / Playlists, where supported)", padding=12)
@@ -212,6 +432,71 @@ class VideoDownloaderGUI:
                 "Open Folder Failed",
                 f"Could not open the download folder:\n{cleaned}",
             )
+
+    def _check_for_update_worker(self):
+        """Check GitHub without blocking the Tk event loop."""
+        try:
+            local_commit, remote, branch = current_update_identity()
+            if not remote:
+                return
+            remote_commit = remote_head_commit(remote, branch)
+            if not update_is_available(local_commit, remote_commit):
+                return
+
+            self._update_remote = remote
+            self._update_branch = branch
+            self.root.after(0, self._show_update_button)
+        except Exception as error:
+            self.log(f"GitHub update check unavailable: {self._clean_error(error)}")
+
+    def _show_update_button(self):
+        if not self.update_button.winfo_ismapped():
+            self.update_button.pack(side="right", padx=(0, 8))
+        self.log("A different source revision is available on GitHub.")
+
+    def download_update_and_rebuild(self):
+        """Hand the rebuild to another process, then close this app."""
+        if not self._update_remote:
+            return
+
+        if getattr(sys, "frozen", False):
+            target_executable = Path(sys.executable).resolve()
+            updater_dir = Path(tempfile.mkdtemp(prefix="yt_downloader_updater_"))
+            updater_executable = updater_dir / "yt_downloader_updater.exe"
+            try:
+                shutil.copy2(target_executable, updater_executable)
+            except OSError as error:
+                messagebox.showerror("Update Failed", self._clean_error(error))
+                return
+            command = [str(updater_executable)]
+        else:
+            source_root = find_source_root()
+            if not source_root:
+                messagebox.showerror("Update Failed", "The project source was not found.")
+                return
+            target_executable = source_root / "dist" / "yt_downloader.exe"
+            command = [sys.executable, str(Path(__file__).resolve())]
+
+        command.extend([
+            "--self-update-worker",
+            "--remote",
+            self._update_remote,
+            "--branch",
+            self._update_branch,
+            "--target-executable",
+            str(target_executable),
+        ])
+
+        self.update_button.state(["disabled"])
+        self.update_button.configure(text="STARTING UPDATER...")
+        try:
+            subprocess.Popen(command, cwd=target_executable.parent)
+        except OSError as error:
+            self.update_button.state(["!disabled"])
+            self.update_button.configure(text="DOWNLOAD UPDATE & REBUILD")
+            messagebox.showerror("Update Failed", self._clean_error(error))
+            return
+        self.root.after(100, self.root.destroy)
 
     def _set_progress(self, value: float, text: str):
         """Safely update download progress from a yt-dlp worker thread."""
@@ -318,6 +603,20 @@ class VideoDownloaderGUI:
         return re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", str(err))
 
     @staticmethod
+    def _numeric_value(value, default: float = 0.0) -> float:
+        """Return a sortable number for optional yt-dlp format metadata.
+
+        Social-media extractors commonly leave fields such as height, fps, or
+        bitrate as None. Those values must not be compared directly with the
+        numeric values from other formats.
+        """
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if number == number else default  # also treat NaN as missing
+
+    @staticmethod
     def _parse_timestamp(value: str, field_name: str) -> float | None:
         """Parse seconds or an HH:MM:SS-style timestamp."""
         value = value.strip()
@@ -353,6 +652,85 @@ class VideoDownloaderGUI:
             return f"{value:g}".replace(".", "_")
 
         return f" [extract {format_time(start)}-{format_time(end)}s]"
+
+    @staticmethod
+    def _process_local_video(
+        filepath: str,
+        clip_range: tuple[float, float] | None,
+        remove_audio: bool,
+    ):
+        """Trim and/or remove audio from an already downloaded video."""
+        source = Path(filepath)
+        if not source.is_file():
+            raise RuntimeError(f"Downloaded video file was not found: {source}")
+
+        ffmpeg = None
+        if FFMPEG_LOCATION:
+            ffmpeg = shutil.which("ffmpeg", path=FFMPEG_LOCATION)
+        ffmpeg = ffmpeg or shutil.which("ffmpeg")
+        if not ffmpeg:
+            action = "create a silent video" if remove_audio else "extract a video clip"
+            raise RuntimeError(f"FFmpeg is required to {action}.")
+
+        processed = source.with_name(f"{source.stem}.processed{source.suffix}")
+        command = [ffmpeg, "-y"]
+        if clip_range:
+            start, end = clip_range
+            command.extend(["-ss", f"{start:g}"])
+        command.extend(["-i", str(source)])
+        if clip_range and end != float("inf"):
+            command.extend(["-t", f"{end - start:g}"])
+        command.extend(["-map", "0:v:0"] if remove_audio else ["-map", "0"])
+        command.extend([
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(processed),
+        ])
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout or "").strip()
+                if len(details) > 2000:
+                    details = details[-2000:]
+                raise RuntimeError(
+                    f"FFmpeg could not process the video (exit code {result.returncode})."
+                    + (f"\n{details}" if details else "")
+                )
+            os.replace(processed, source)
+        finally:
+            if processed.exists():
+                processed.unlink()
+
+    @staticmethod
+    def _find_downloaded_filepath(
+        info: dict,
+        prepared_filepath: str | None,
+        merge_extension: str | None,
+    ) -> str:
+        """Resolve yt-dlp's final file, including a post-merge extension change."""
+        candidates = [info.get("filepath"), info.get("_filename"), prepared_filepath]
+        if prepared_filepath and merge_extension:
+            candidates.insert(0, str(Path(prepared_filepath).with_suffix(
+                f".{merge_extension}"
+            )))
+
+        for requested in info.get("requested_downloads") or []:
+            candidates.append(requested.get("filepath"))
+
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return candidate
+        raise RuntimeError("yt-dlp did not report the downloaded video path.")
 
     def _extract_info_with_fallback(self, url: str):
         base_opts = {
@@ -422,8 +800,21 @@ class VideoDownloaderGUI:
                 if f.get("acodec") != "none" and f.get("vcodec") == "none"
             ]
 
-            self.video_formats.sort(key=lambda x: (x.get("height", 0), x.get("fps", 0), x.get("tbr", 0)), reverse=True)
-            self.audio_formats.sort(key=lambda x: (x.get("abr", 0), x.get("asr", 0)), reverse=True)
+            self.video_formats.sort(
+                key=lambda x: (
+                    self._numeric_value(x.get("height")),
+                    self._numeric_value(x.get("fps")),
+                    self._numeric_value(x.get("tbr")),
+                ),
+                reverse=True,
+            )
+            self.audio_formats.sort(
+                key=lambda x: (
+                    self._numeric_value(x.get("abr")),
+                    self._numeric_value(x.get("asr")),
+                ),
+                reverse=True,
+            )
 
             self.root.after(
                 0,
@@ -455,16 +846,14 @@ class VideoDownloaderGUI:
         self.audio_id_to_format.clear()
 
         for vf in video_formats:
-            resolution = (
-                f"{vf['height']}p"
-                if vf.get("height")
-                else "resolution unavailable"
-            )
-            fps = f" {vf['fps']}fps" if vf.get("fps") else ""
+            height = self._numeric_value(vf.get("height"))
+            resolution = f"{int(height)}p" if height > 0 else "resolution unavailable"
+            fps_value = self._numeric_value(vf.get("fps"))
+            fps = f" {fps_value:g}fps" if fps_value > 0 else ""
             label = (
                 f"id={vf.get('format_id')} | {vf.get('ext')} | "
                 f"{resolution}{fps} | "
-                f"~{int(vf.get('tbr', 0))}kbps"
+                f"~{int(self._numeric_value(vf.get('tbr')))}kbps"
             )
             iid = self.video_list.insert("", END, values=(label,))
             self.video_id_to_format[iid] = vf
@@ -472,10 +861,23 @@ class VideoDownloaderGUI:
         for af in audio_formats:
             label = (
                 f"id={af.get('format_id')} | {af.get('ext')} | "
-                f"{af.get('acodec')} | {int(af.get('abr', 0))}kbps"
+                f"{af.get('acodec')} | {int(self._numeric_value(af.get('abr')))}kbps"
             )
             iid = self.audio_list.insert("", END, values=(label,))
             self.audio_id_to_format[iid] = af
+
+        # Formats are sorted best-first before they reach this method. Select
+        # the top video and audio entries so a pasted link is ready to download
+        # without requiring extra clicks.
+        video_items = self.video_list.get_children()
+        if video_items:
+            self.video_list.selection_set(video_items[0])
+            self.video_list.focus(video_items[0])
+
+        audio_items = self.audio_list.get_children()
+        if audio_items:
+            self.audio_list.selection_set(audio_items[0])
+            self.audio_list.focus(audio_items[0])
 
         self._set_progress(0, "Select a quality, then download")
         self.log(f"Loaded formats for: {title}")
@@ -527,7 +929,10 @@ class VideoDownloaderGUI:
         if selected_video:
             video_format = self.video_id_to_format.get(selected_video[0], {})
             video_id = video_format.get("format_id")
-            video_has_audio = video_format.get("acodec") not in (None, "none")
+            # Unknown audio metadata is treated conservatively: if the user
+            # requests video only, FFmpeg will verify the result by retaining
+            # only its video stream.
+            video_has_audio = video_format.get("acodec") != "none"
 
         audio_id = None
         if selected_audio:
@@ -557,23 +962,16 @@ class VideoDownloaderGUI:
         clip_range: tuple[float, float] | None = None,
     ):
         try:
-            audio_only = video_id is None
+            fmt, download_mode = build_download_plan(video_id, audio_id)
+            audio_only = download_mode == "audio_only"
+            video_only = download_mode == "video_only"
 
             if audio_only:
-                fmt = audio_id
-            elif audio_id:
-                fmt = f"{video_id}+{audio_id}"
-            elif video_has_audio:
-                # A combined social-media stream already has its own audio.
-                fmt = video_id
+                download_kind = "MP3 audio"
+            elif video_only:
+                download_kind = "silent video"
             else:
-                # Most high-quality video streams are video-only. When the
-                # user chooses one without an explicit audio selection, add
-                # the platform's best available audio rather than silently
-                # producing a mute download.
-                fmt = f"{video_id}+bestaudio/best"
-
-            download_kind = "MP3 audio" if audio_only else "selected format"
+                download_kind = "selected video and audio"
             if clip_range:
                 download_kind += " extract"
             self.log(f"Downloading {download_kind} ({fmt})...")
@@ -594,13 +992,6 @@ class VideoDownloaderGUI:
             }
             if FFMPEG_LOCATION:
                 ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
-
-            if clip_range and not audio_only:
-                ydl_opts["download_ranges"] = download_range_func(None, [clip_range])
-                ydl_opts["force_keyframes_at_cuts"] = True
-                # Prefer direct HTTP formats; FFmpeg can produce empty section files
-                # when seeking in some HLS streams.
-                ydl_opts["format_sort"] = ["proto:https"]
 
             if audio_only:
                 ydl_opts["postprocessors"] = [{
@@ -630,16 +1021,55 @@ class VideoDownloaderGUI:
                             f"{end - start:g}",
                         ]
                     ydl_opts["postprocessor_args"] = postprocessor_args
-            else:
+            elif not video_only:
                 ydl_opts["merge_output_format"] = "mp4"
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            info = None
+            prepared_filepath = None
+            for attempt in range(2):
+                try:
+                    # Re-extract on every attempt. YouTube media URLs are signed
+                    # and temporary, so retrying with the same extracted URL can
+                    # repeat an otherwise transient HTTP 403.
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        prepared_filepath = ydl.prepare_filename(info)
+                    break
+                except Exception as e:
+                    error_text = self._clean_error(e)
+                    is_forbidden = "403" in error_text or "Forbidden" in error_text
+                    if attempt == 1 or not is_forbidden:
+                        raise
+                    self.log(
+                        "YouTube returned HTTP 403; refreshing its temporary "
+                        "media URL and retrying..."
+                    )
+                    self._set_progress(
+                        self._progress_value,
+                        "Refreshing the media URL after HTTP 403...",
+                    )
+
+            if (clip_range and not audio_only) or (video_only and video_has_audio):
+                filepath = self._find_downloaded_filepath(
+                    info or {},
+                    prepared_filepath,
+                    ydl_opts.get("merge_output_format"),
+                )
+                self._process_local_video(
+                    filepath,
+                    clip_range,
+                    remove_audio=video_only and video_has_audio,
+                )
 
             if clip_range:
                 completion_text = "Clip extract complete"
             else:
-                completion_text = "MP3 download complete" if audio_only else "Download complete"
+                if audio_only:
+                    completion_text = "MP3 download complete"
+                elif video_only:
+                    completion_text = "Silent video download complete"
+                else:
+                    completion_text = "Download complete"
             self._set_progress(100, completion_text)
             self.log(f"Done. Saved to: {DOWNLOAD_DIR}")
             messagebox.showinfo(
@@ -699,10 +1129,37 @@ class VideoDownloaderGUI:
 
 
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--self-update-worker", action="store_true")
+    parser.add_argument("--remote", default="")
+    parser.add_argument("--branch", default="main")
+    parser.add_argument("--target-executable", default="")
+    parser.add_argument("--update-error", default="")
+    args, _unknown = parser.parse_known_args()
+
+    if args.self_update_worker:
+        if sys.platform != "win32" or not args.remote or not args.target_executable:
+            return 2
+        return run_update_worker(
+            args.remote,
+            args.branch,
+            Path(args.target_executable).resolve(),
+        )
+
     root = Tk()
     app = VideoDownloaderGUI(root)
+    if args.update_error:
+        error_log = Path(args.update_error)
+        root.after(
+            200,
+            lambda: messagebox.showerror(
+                "Update Failed",
+                f"The previous version was reopened. Details are in:\n{error_log}",
+            ),
+        )
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

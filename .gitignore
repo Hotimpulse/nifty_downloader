@@ -17,6 +17,7 @@ htmlcov/
 build/
 dist/
 *.spec
+build_metadata.py
 
 # Locally downloaded media and app data
 downloads/

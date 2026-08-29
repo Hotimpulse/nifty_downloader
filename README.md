@@ -1,14 +1,16 @@
 # Video Downloader (Tkinter)
 
 A simple GUI app powered by `yt-dlp` that lets you:
-- Download public videos from YouTube, Instagram, Facebook, and TikTok
+- Download public videos from YouTube, X, Instagram, Facebook, and TikTok
 - Paste a video URL and inspect available video/audio quality formats
 - Choose formats and click **DOWNLOAD**
+- Deselect audio to download a silent video, or deselect video to download MP3 audio
 - Select only an audio format to download and convert it to MP3
 - Optionally download only a start/end time range from a video or audio clip
 - Download the most recent N videos from a channel/playlist
 - Track active downloads with the progress bar at the bottom of the window
 - Open the download folder from the button at the top of the window
+- Detect a different GitHub revision and update, rebuild, and relaunch in one click on Windows
 - Build a native desktop app on Windows or macOS
 
 ## Folder structure
@@ -97,15 +99,21 @@ app, and a Mac cannot make a Windows executable.
 - Edit `version_info.txt` to change product name, company, and version number shown in Windows file properties.
 - Put your icon file as `app.ico` in the project root to brand the executable.
 - Recommended icon sizes inside `.ico`: 16x16, 32x32, 48x48, 256x256.
+- Each build embeds its Git commit, branch, and remote. When GitHub publishes a
+  different commit, **DOWNLOAD UPDATE & REBUILD** appears. It uses a fresh clone,
+  closes the current app, rebuilds it, replaces the executable, and relaunches it.
+- The one-click rebuild requires Git and `uv` on `PATH`. Failures are written to
+  `yt_downloader_update.log`, and the previous executable is reopened.
 
 ## Usage
 
 ### Single video
-1. Paste a public YouTube, Instagram, Facebook, or TikTok video URL
+1. Paste a public YouTube, X, Instagram, Facebook, or TikTok video URL
 2. Click **Paste & Check** after copying a URL, or paste into the field and press Enter.
-   The app checks qualities automatically after a normal paste too.
-3. Select a video format, an audio format, or both. A video-only stream gets
-   the best available audio automatically; selecting only audio creates an MP3.
+   The app checks qualities automatically after a normal paste too and selects
+   the highest-ranked video and audio formats.
+3. Select a video format, an audio format, or both. Use **Deselect Audio** for
+   a silent video, or **Deselect Video** to convert the selected audio to MP3.
 4. Optionally enter Start and End as seconds or `HH:MM:SS` to extract only that range.
 5. Click **DOWNLOAD**
 
@@ -133,5 +141,7 @@ macOS packaged app:        ~/Downloads/Video Downloader/downloads
   videos expose only one combined video-and-audio format, while others may not
   offer separate audio formats.
 - Audio-only extracts download the selected source audio before trimming it during MP3 conversion. This is more reliable than seeking inside remote streams.
+- Video clip extracts download and merge the selected streams before trimming the local file. This avoids failures when FFmpeg cannot seek a temporary YouTube media URL directly.
+- A transient YouTube HTTP 403 is retried after refreshing the temporary media URL.
 - Some URLs may be geo/age-restricted and can fail.
 - Downloading content should comply with each platform's terms and your local laws.

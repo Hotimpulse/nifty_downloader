@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,37 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 APP_NAME = "yt_downloader"
+BUILD_METADATA = PROJECT_ROOT / "build_metadata.py"
+
+
+def git_value(*args: str, default: str = "") -> str:
+    """Read build identity without making the build depend on Git metadata."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return default
+
+
+def write_build_metadata() -> None:
+    """Embed the GitHub revision represented by the executable."""
+    values = {
+        "BUILD_COMMIT": git_value("rev-parse", "HEAD", default="unknown"),
+        "BUILD_REMOTE": git_value("remote", "get-url", "origin"),
+        "BUILD_BRANCH": git_value("branch", "--show-current", default="main") or "main",
+    }
+    BUILD_METADATA.write_text(
+        "\n".join(f"{key} = {json.dumps(value)}" for key, value in values.items())
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_command() -> tuple[list[str], Path]:
@@ -59,6 +91,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        write_build_metadata()
         command, artifact = build_command()
     except RuntimeError as error:
         print(f"[ERROR] {error}", file=sys.stderr)

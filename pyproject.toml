@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "Tkinter GUI for downloading videos and audio with yt-dlp"
 requires-python = ">=3.11"
 dependencies = [
-    "yt-dlp>=2026.3.0",
+    "yt-dlp>=2026.8.19",
 ]
 
 [dependency-groups]
