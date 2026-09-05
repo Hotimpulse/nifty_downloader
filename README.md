@@ -1,4 +1,4 @@
-# Video Downloader (Tkinter)
+# Video Downloader (PySide6 / Qt)
 
 A simple GUI app powered by `yt-dlp` that lets you:
 - Download public videos from YouTube, X, Instagram, Facebook, and TikTok
@@ -6,11 +6,14 @@ A simple GUI app powered by `yt-dlp` that lets you:
 - Choose formats and click **DOWNLOAD**
 - Deselect audio to download a silent video, or deselect video to download MP3 audio
 - Select only an audio format to download and convert it to MP3
+- Preview the video with FFmpeg and drag both ends of a range picker to set the extract window
 - Optionally download only a start/end time range from a video or audio clip
+- Review completed downloads in History and reveal any file in Explorer or Finder
+- Set preferred video and audio qualities for automatic format selection
 - Download the most recent N videos from a channel/playlist
 - Track active downloads with the progress bar at the bottom of the window
 - Open the download folder from the button at the top of the window
-- Detect a different GitHub revision and update, rebuild, and relaunch in one click on Windows
+- Detect a different GitHub revision and update, rebuild, replace, and relaunch in one click on Windows or macOS
 - Build a native desktop app on Windows or macOS
 
 ## Folder structure
@@ -100,10 +103,11 @@ app, and a Mac cannot make a Windows executable.
 - Put your icon file as `app.ico` in the project root to brand the executable.
 - Recommended icon sizes inside `.ico`: 16x16, 32x32, 48x48, 256x256.
 - Each build embeds its Git commit, branch, and remote. When GitHub publishes a
-  different commit, **DOWNLOAD UPDATE & REBUILD** appears. It uses a fresh clone,
-  closes the current app, rebuilds it, replaces the executable, and relaunches it.
+  different commit, the top-right **↓ Update available** button appears. It uses
+  a fresh clone, closes the current app, rebuilds the native artifact, removes the
+  old executable/app bundle, installs the new one, and relaunches it.
 - The one-click rebuild requires Git and `uv` on `PATH`. Failures are written to
-  `yt_downloader_update.log`, and the previous executable is reopened.
+  `yt_downloader_update.log`, and the previous app is reopened.
 
 ## Usage
 
@@ -114,8 +118,14 @@ app, and a Mac cannot make a Windows executable.
    the highest-ranked video and audio formats.
 3. Select a video format, an audio format, or both. Use **Deselect Audio** for
    a silent video, or **Deselect Video** to convert the selected audio to MP3.
-4. Optionally enter Start and End as seconds or `HH:MM:SS` to extract only that range.
-5. Click **DOWNLOAD**
+4. Wait for the FFmpeg preview to load. The Start and End fields are prepopulated
+   with `00:00:00` and the full video duration.
+5. Drag the green Start or red End handle under the preview, or edit either time
+   field directly. Click **Play preview** to review the selected window.
+6. Choose video, audio, or both formats, then click **DOWNLOAD** to extract that
+   range in the selected mode.
+7. Use **History** to revisit completed files, or **Settings** to change the
+   default video resolution and audio bitrate selected after analyzing a link.
 
 ### Batch (recent videos)
 1. Paste channel or playlist URL in batch section
